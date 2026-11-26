@@ -58,10 +58,9 @@ jobs:
       - name: Setup KernelSU Next and SUSFS
         run: |
           cd kernel_src
-          chmod -R u+w drivers/
+          chmod -R u+w .
 
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-
           grep -n "kernelsu" drivers/Makefile drivers/Kconfig || true
 
           rm -rf ../susfs_tmp
@@ -70,23 +69,14 @@ jobs:
           cp -rv ../susfs_tmp/kernel_patches/fs/* fs/
           cp -rv ../susfs_tmp/kernel_patches/include/linux/* include/linux/
 
-          # Terapkan patch kernel SuSFS jika tersedia di repositori
-          for p in ../susfs_tmp/kernel_patches/*4.19*.patch ../susfs_tmp/kernel_patches/*.patch; do
-            [ -f "$p" ] || continue
-            echo "=== Applying patch: $p ==="
-            patch -p1 --forward --dry-run < "$p" && patch -p1 --forward < "$p" || echo "WARN: patch conflict on $p"
-          done
+          PATCH_419="../susfs_tmp/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+          if [ -f "$PATCH_419" ]; then
+            echo "=== Applying SuSFS 4.19 patch ==="
+            patch -p1 --forward --force < "$PATCH_419" || true
+          fi
 
-          # Terapkan patch sisi KernelSU jika tersedia di susfs4ksu
-          for kp in ../susfs_tmp/KernelSU-Next/*.patch ../susfs_tmp/ksu_patches/*.patch; do
-            [ -f "$kp" ] || continue
-            echo "=== Applying KSU patch: $kp ==="
-            patch -p1 --forward --dry-run < "$kp" && patch -p1 --forward < "$kp" || echo "WARN: ksu patch conflict on $kp"
-          done
-
+          echo "=== Remaining .rej files ==="
           find . -name "*.rej" || true
-          ls -la | grep -iE "ksu|susfs" || true
-          find . -maxdepth 3 -iname "*ksu*" -o -iname "*susfs*" || true
 
       - name: Compile kernel
         env:
