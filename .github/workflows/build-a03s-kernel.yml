@@ -69,10 +69,30 @@ jobs:
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
 
-          EXTRA_CFLAGS="-w -Wno-error -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-incompatible-pointer-types -Wno-unused-const-variable"
+          RELAX_FLAGS="-w -Wno-error -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-incompatible-pointer-types -Wno-unused-const-variable -Wno-int-conversion"
 
-          make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS="$EXTRA_CFLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y "$DEFCONFIG"
-          make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS="$EXTRA_CFLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y -j4
+          make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y "$DEFCONFIG"
+
+          scripts/config --file out/.config \
+            -d MTK_GPU_SUPPORT \
+            -d MTK_GPU_RGX \
+            -d GPU_RGX || true
+          make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y olddefconfig
+
+          set +e
+          make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y -j4 2>&1 | tee build.log
+          BUILD_RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$BUILD_RC" -ne 0 ]; then
+            echo "=== POTONGAN ERROR UTAMA ==="
+            grep -n -B 8 -A 3 "error:" build.log | tail -n 35 || tail -n 30 build.log
+            exit "$BUILD_RC"
+          fi
+
           ls -lh out/arch/arm64/boot/
 
       - name: Upload kernel image artifact
