@@ -104,8 +104,8 @@ jobs:
           #endif\n""",
                   t_exec,
                   count=1
-             )
-             p_exec.write_text(t_exec, encoding="utf-8")
+              )
+              p_exec.write_text(t_exec, encoding="utf-8")
 
           # 2. fs/open.c (do_faccessat)
           open_snip = """#ifdef CONFIG_KSU
@@ -125,7 +125,7 @@ jobs:
                   count=1
               )
               p_open.write_text(t_open, encoding="utf-8")
-   
+
           # 3. fs/read_write.c (vfs_read)
           rw_snip = """#ifdef CONFIG_KSU
           extern bool ksu_vfs_read_hook __read_mostly;
@@ -197,6 +197,7 @@ jobs:
             -d RKP \
             -d UH \
             -e KSU \
+            -d KSU_WITH_KPROBE \
             -d KSU_SUSFS || true
 
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
