@@ -61,7 +61,7 @@ jobs:
           chmod -R u+w .
 
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          grep -n "kernelsu" drivers/Makefile drivers/Kconfig || true
+          grep -rn "ksu_handle_" drivers/kernelsu/ | head -n 40 || true
 
           python3 - <<'PY'
           from pathlib import Path
