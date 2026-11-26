@@ -78,9 +78,131 @@ jobs:
           echo "=== Remaining .rej files ==="
           find . -name "*.rej" || true
           for r in $(find . -name "*.rej" | sort); do
-          echo "================ $r ================"
-          cat "$r"
+            echo "================ $r ================"
+            cat "$r"
           done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          # 1. fs/namespace.c
+          ns_path = Path("fs/namespace.c")
+          ns = ns_path.read_text(encoding="utf-8", errors="ignore")
+          inc_target = "#include <linux/sched/task.h>"
+          inc_add = textwrap.dedent("""\
+          #include <linux/sched/task.h>
+          #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)
+          #include <linux/susfs_def.h>
+          #endif""")
+          if "susfs_def.h" not in ns and inc_target in ns:
+              ns = ns.replace(inc_target, inc_add, 1)
+
+          ns_block = textwrap.dedent("""\
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          extern bool susfs_is_current_ksu_domain(void);
+          extern bool susfs_is_current_zygote_domain(void);
+
+          static DEFINE_IDA(susfs_mnt_id_ida);
+          static DEFINE_IDA(susfs_mnt_group_ida);
+
+          #define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
+          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+          bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+          bool susfs_is_auto_add_sus_bind_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+          bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
+          #endif
+
+          """)
+          sys_target = "unsigned int sysctl_mount_max"
+          if "susfs_is_current_ksu_domain" not in ns and sys_target in ns:
+              ns = ns.replace(sys_target, ns_block + sys_target, 1)
+          ns_path.write_text(ns, encoding="utf-8")
+
+          # 2. fs/proc/task_mmu.c
+          mmu_path = Path("fs/proc/task_mmu.c")
+          mmu = mmu_path.read_text(encoding="utf-8", errors="ignore")
+          mmu_target = "#include <linux/mm_inline.h>"
+          mmu_add = textwrap.dedent("""\
+          #include <linux/mm_inline.h>
+          #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+          #include <linux/susfs_def.h>
+          #endif""")
+          if "susfs_def.h" not in mmu and mmu_target in mmu:
+              mmu = mmu.replace(mmu_target, mmu_add, 1)
+              mmu_path.write_text(mmu, encoding="utf-8")
+
+          # 3. include/linux/sched.h
+          sched_path = Path("include/linux/sched.h")
+          sched = sched_path.read_text(encoding="utf-8", errors="ignore")
+          sched_target = "\trandomized_struct_fields_end"
+          sched_add = textwrap.dedent("""\
+          #if defined(CONFIG_KSU_SUSFS) && !defined(ANDROID_KABI_RESERVE)
+          \tu64 susfs_task_state;
+          #endif
+          #if defined(CONFIG_KSU_SUSFS) && !defined(ANDROID_KABI_RESERVE)
+          \tu64 susfs_last_fake_mnt_id;
+          #endif
+          \trandomized_struct_fields_end""")
+          if "susfs_task_state" not in sched and sched_target in sched:
+              sched = sched.replace(sched_target, sched_add, 1)
+              sched_path.write_text(sched, encoding="utf-8")
+
+          # 4. fs/notify/fdinfo.c
+          fd_path = Path("fs/notify/fdinfo.c")
+          fd = fd_path.read_text(encoding="utf-8", errors="ignore")
+          fd_hook = textwrap.dedent("""\
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+          \t\t\t\tunlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {
+          \t\t\tstruct path path;
+          \t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
+          \t\t\tchar *dpath;
+          \t\t\tif (!pathname) {
+          \t\t\t\tgoto out_seq_printf_susfs;
+          \t\t\t}
+          \t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+          \t\t\tif (!dpath) {
+          \t\t\t\tgoto out_free_pathname_susfs;
+          \t\t\t}
+          \t\t\tif (kern_path(dpath, 0, &path)) {
+          \t\t\t\tgoto out_free_pathname_susfs;
+          \t\t\t}
+          \t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
+          \t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino, path.dentry->d_inode->i_sb->s_dev,
+          \t\t\t   inotify_mark_user_mask(mark));
+          \t\t\tshow_mark_fhandle(m, path.dentry->d_inode);
+          \t\t\tseq_putc(m, '\\n');
+          \t\t\tiput(inode);
+          \t\t\tpath_put(&path);
+          \t\t\tkfree(pathname);
+          \t\t\treturn;
+          out_free_pathname_susfs:
+          \t\t\tkfree(pathname);
+          \t\t}
+          out_seq_printf_susfs:
+          #endif
+          """)
+          anchor = 'seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 "'
+          if "CONFIG_KSU_SUSFS_SUS_MOUNT" not in fd and anchor in fd:
+              idx = fd.find(anchor)
+              line_start = fd.rfind("\n", 0, idx) + 1
+              fd = fd[:line_start] + fd_hook + fd[line_start:]
+              fd_path.write_text(fd, encoding="utf-8")
+          PY
+          find . -name "*.rej" -delete
+          echo "=== .rej after cleanup ==="
+          find . -name "*.rej" || true
 
       - name: Compile kernel
         env:
