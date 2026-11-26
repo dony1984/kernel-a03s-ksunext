@@ -55,104 +55,17 @@ jobs:
           clang --version
           aarch64-linux-gnu-gcc --version | head -n 1
 
-      - name: Setup KernelSU Next (Manual Hook)
+      - name: Setup KernelSU Next (Non-GKI Syscall Hook)
         run: |
           cd kernel_src
           chmod -R u+w .
 
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
           grep -n "kernelsu" drivers/Makefile drivers/Kconfig || true
-          echo "=== Fungsi ksu_handle_ di drivers/kernelsu ==="
-          grep -rn "ksu_handle_execve\|ksu_handle_faccessat\|ksu_handle_input_handle_event\|ksu_handle_setresuid" drivers/kernelsu/ | head -n 40 || true
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          def inject_before(path_str, marker, snippet, check_str):
-              p = Path(path_str)
-              if not p.exists():
-                  print(f"SKIP: {path_str} not found")
-                  return
-              txt = p.read_text(encoding="utf-8", errors="ignore")
-              if check_str in txt:
-                  print(f"ALREADY PATCHED: {path_str}")
-                  return
-              if marker not in txt:
-                  print(f"WARNING: marker not found in {path_str}")
-                  return
-              txt = txt.replace(marker, snippet + "\n" + marker, 1)
-              p.write_text(txt, encoding="utf-8")
-              print(f"PATCHED: {path_str}")
-
-          # 1. fs/exec.c (do_execveat_common)
-          p_exec = Path("fs/exec.c")
-          if p_exec.exists():
-              t_exec = p_exec.read_text(encoding="utf-8", errors="ignore")
-              if "ksu_handle_execveat(" not in t_exec and "static int do_execveat_common(" in t_exec:
-                  exec_snip = """#ifdef CONFIG_KSU
-          extern bool ksu_execveat_hook __read_mostly;
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
-          extern int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
-          #endif"""
-                  t_exec = t_exec.replace("static int do_execveat_common(", exec_snip + "\nstatic int do_execveat_common(", 1)
-                  t_exec = re.sub(
-                      r"(static int do_execveat_common\([^\{]+\{\s*)",
-                      r"""\1#ifdef CONFIG_KSU
-          \tif (unlikely(ksu_execveat_hook))
-          \t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
-          \telse
-          \t\tksu_handle_execveat_ksud(&fd, &filename, &argv, &envp, &flags);
-          #endif\n""",
-                      t_exec,
-                      count=1
-                  )
-                  p_exec.write_text(t_exec, encoding="utf-8")
-                  print("PATCHED: fs/exec.c")
-
-          # 2. fs/open.c (do_faccessat / ksys_faccessat)
-          p_open = Path("fs/open.c")
-          if p_open.exists():
-              t_open = p_open.read_text(encoding="utf-8", errors="ignore")
-              target_fn = "long do_faccessat(" if "long do_faccessat(" in t_open else ("long ksys_faccessat(" if "long ksys_faccessat(" in t_open else "")
-              if target_fn and "ksu_handle_faccessat" not in t_open:
-                  open_snip = """#ifdef CONFIG_KSU
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
-          #endif\n"""
-                  t_open = t_open.replace(target_fn, open_snip + target_fn, 1)
-                  t_open = re.sub(
-                      r"(" + re.escape(target_fn) + r"[^\{]+\{\s*)",
-                      r"""\1#ifdef CONFIG_KSU
-          \tksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif\n""",
-                      t_open,
-                      count=1
-                  )
-                  p_open.write_text(t_open, encoding="utf-8")
-                  print(f"PATCHED: fs/open.c ({target_fn})")
-
-          # 3. drivers/input/input.c (input_event)
-          inp_snip = """#ifdef CONFIG_KSU
-          extern bool ksu_input_hook __read_mostly;
-          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
-          #endif"""
-          inject_before("drivers/input/input.c", "void input_event(", inp_snip, "ksu_handle_input_handle_event")
-
-          p_inp = Path("drivers/input/input.c")
-          if p_inp.exists():
-              t_inp = p_inp.read_text(encoding="utf-8", errors="ignore")
-              if "ksu_handle_input_handle_event(&type" not in t_inp and "void input_event(" in t_inp:
-                  t_inp = re.sub(
-                      r"(void input_event\([^\{]+\{\s*)",
-                      r"""\1#ifdef CONFIG_KSU
-          \tif (unlikely(ksu_input_hook))
-          \t\tksu_handle_input_handle_event(&type, &code, &value);
-          #endif\n""",
-                      t_inp,
-                      count=1
-                  )
-                  p_inp.write_text(t_inp, encoding="utf-8")
-          PY
+          curl -LSs "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/syscall_hook_patches.sh" -o ../syscall_hook_patches.sh
+          chmod +x ../syscall_hook_patches.sh
+          bash ../syscall_hook_patches.sh || true
 
       - name: Compile kernel
         env:
@@ -183,13 +96,12 @@ jobs:
             -d UH \
             -e KSU \
             -e KSU_MANUAL_HOOK \
-            -d KSU_WITH_KPROBE \
             -d KSU_SUSFS || true
 
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y olddefconfig
 
-          grep -iE "CONFIG_KSU|MANUAL_HOOK|KPROBE|SUSFS|DEFEX|PROCA|RKP" out/.config || true
+          grep -iE "CONFIG_KSU|MANUAL_HOOK|SUSFS|DEFEX|PROCA|RKP" out/.config || true
 
           set +e
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
@@ -205,7 +117,7 @@ jobs:
             exit "$BUILD_RC"
           fi
           ls -lh out/arch/arm64/boot/
-          
+
       - name: Upload kernel image artifact
         if: always()
         uses: actions/upload-artifact@v4
