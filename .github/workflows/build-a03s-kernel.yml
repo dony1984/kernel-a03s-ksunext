@@ -126,28 +126,7 @@ jobs:
               )
               p_open.write_text(t_open, encoding="utf-8")
 
-          # 3. fs/read_write.c (vfs_read)
-          rw_snip = """#ifdef CONFIG_KSU
-          extern bool ksu_vfs_read_hook __read_mostly;
-          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);
-          #endif"""
-          inject_before("fs/read_write.c", "ssize_t vfs_read(", rw_snip, "ksu_handle_vfs_read")
-
-          p_rw = Path("fs/read_write.c")
-          t_rw = p_rw.read_text(encoding="utf-8", errors="ignore")
-          if "ksu_handle_vfs_read(&file" not in t_rw:
-              t_rw = re.sub(
-                  r"(ssize_t vfs_read\([^\{]+\{\s*)",
-                  r"""\1#ifdef CONFIG_KSU
-          \tif (unlikely(ksu_vfs_read_hook))
-          \t\tksu_handle_vfs_read(&file, &buf, &count, &pos);
-          #endif\n""",
-                  t_rw,
-                  count=1
-              )
-              p_rw.write_text(t_rw, encoding="utf-8")
-
-          # 4. drivers/input/input.c (input_event)
+          # 3. drivers/input/input.c (input_event)
           inp_snip = """#ifdef CONFIG_KSU
           extern bool ksu_input_hook __read_mostly;
           extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
