@@ -1,0 +1,49 @@
+name: Extract Source from GitHub Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag rilis di GitHub Releases (contoh: source-v1)"
+        required: true
+        default: "source-v1"
+      archive_name:
+        description: "Nama file arsip di Release (contoh: Kernel.tar.gz)"
+        required: true
+        default: "Kernel.tar.gz"
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          FILE: ${{ inputs.archive_name }}
+        run: |
+          mkdir -p archive_tmp kernel_src
+          gh release download "$TAG" -R "${{ github.repository }}" -p "$FILE" -D archive_tmp
+          ls -lh archive_tmp
+
+      - name: Extract archive in Linux runner
+        env:
+          FILE: ${{ inputs.archive_name }}
+        run: |
+          tar -xf "archive_tmp/$FILE" -C kernel_src
+
+          # Jika di dalamnya masih terdapat arsip .tar / .tar.gz / .tar.xz tambahan:
+          find kernel_src -maxdepth 2 -name "*.tar*" -exec sh -c '
+            for f do
+              target_dir="${f%.tar*}"
+              mkdir -p "$target_dir"
+              tar -xf "$f" -C "$target_dir"
+            done
+          ' sh {} +
+
+          ls -la kernel_src
