@@ -61,7 +61,9 @@ jobs:
           chmod -R u+w .
 
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          grep -rn "ksu_handle_" drivers/kernelsu/ | head -n 40 || true
+          grep -n "kernelsu" drivers/Makefile drivers/Kconfig || true
+          echo "=== Fungsi ksu_handle_ di drivers/kernelsu ==="
+          grep -rn "ksu_handle_execve\|ksu_handle_faccessat\|ksu_handle_input_handle_event\|ksu_handle_setresuid" drivers/kernelsu/ | head -n 40 || true
 
           python3 - <<'PY'
           from pathlib import Path
@@ -84,47 +86,50 @@ jobs:
               print(f"PATCHED: {path_str}")
 
           # 1. fs/exec.c (do_execveat_common)
-          exec_snip = """#ifdef CONFIG_KSU
+          p_exec = Path("fs/exec.c")
+          if p_exec.exists():
+              t_exec = p_exec.read_text(encoding="utf-8", errors="ignore")
+              if "ksu_handle_execveat(" not in t_exec and "static int do_execveat_common(" in t_exec:
+                  exec_snip = """#ifdef CONFIG_KSU
           extern bool ksu_execveat_hook __read_mostly;
           extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
-          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
+          extern int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
           #endif"""
-          inject_before("fs/exec.c", "static int do_execveat_common(", exec_snip, "ksu_handle_execveat")
-
-          p_exec = Path("fs/exec.c")
-          t_exec = p_exec.read_text(encoding="utf-8", errors="ignore")
-          if "ksu_handle_execveat(&fd" not in t_exec:
-              t_exec = re.sub(
-                  r"(static int do_execveat_common\([^\{]+\{\s*)",
-                  r"""\1#ifdef CONFIG_KSU
+                  t_exec = t_exec.replace("static int do_execveat_common(", exec_snip + "\nstatic int do_execveat_common(", 1)
+                  t_exec = re.sub(
+                      r"(static int do_execveat_common\([^\{]+\{\s*)",
+                      r"""\1#ifdef CONFIG_KSU
           \tif (unlikely(ksu_execveat_hook))
           \t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
           \telse
-          \t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+          \t\tksu_handle_execveat_ksud(&fd, &filename, &argv, &envp, &flags);
           #endif\n""",
-                  t_exec,
-                  count=1
-              )
-              p_exec.write_text(t_exec, encoding="utf-8")
+                      t_exec,
+                      count=1
+                  )
+                  p_exec.write_text(t_exec, encoding="utf-8")
+                  print("PATCHED: fs/exec.c")
 
-          # 2. fs/open.c (do_faccessat)
-          open_snip = """#ifdef CONFIG_KSU
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
-          #endif"""
-          inject_before("fs/open.c", "long do_faccessat(", open_snip, "ksu_handle_faccessat")
-
+          # 2. fs/open.c (do_faccessat / ksys_faccessat)
           p_open = Path("fs/open.c")
-          t_open = p_open.read_text(encoding="utf-8", errors="ignore")
-          if "ksu_handle_faccessat(&dfd" not in t_open:
-              t_open = re.sub(
-                  r"(long do_faccessat\([^\{]+\{\s*)",
-                  r"""\1#ifdef CONFIG_KSU
+          if p_open.exists():
+              t_open = p_open.read_text(encoding="utf-8", errors="ignore")
+              target_fn = "long do_faccessat(" if "long do_faccessat(" in t_open else ("long ksys_faccessat(" if "long ksys_faccessat(" in t_open else "")
+              if target_fn and "ksu_handle_faccessat" not in t_open:
+                  open_snip = """#ifdef CONFIG_KSU
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
+          #endif\n"""
+                  t_open = t_open.replace(target_fn, open_snip + target_fn, 1)
+                  t_open = re.sub(
+                      r"(" + re.escape(target_fn) + r"[^\{]+\{\s*)",
+                      r"""\1#ifdef CONFIG_KSU
           \tksu_handle_faccessat(&dfd, &filename, &mode, NULL);
           #endif\n""",
-                  t_open,
-                  count=1
-              )
-              p_open.write_text(t_open, encoding="utf-8")
+                      t_open,
+                      count=1
+                  )
+                  p_open.write_text(t_open, encoding="utf-8")
+                  print(f"PATCHED: fs/open.c ({target_fn})")
 
           # 3. drivers/input/input.c (input_event)
           inp_snip = """#ifdef CONFIG_KSU
@@ -134,18 +139,19 @@ jobs:
           inject_before("drivers/input/input.c", "void input_event(", inp_snip, "ksu_handle_input_handle_event")
 
           p_inp = Path("drivers/input/input.c")
-          t_inp = p_inp.read_text(encoding="utf-8", errors="ignore")
-          if "ksu_handle_input_handle_event(&type" not in t_inp:
-              t_inp = re.sub(
-                  r"(void input_event\([^\{]+\{\s*)",
-                  r"""\1#ifdef CONFIG_KSU
+          if p_inp.exists():
+              t_inp = p_inp.read_text(encoding="utf-8", errors="ignore")
+              if "ksu_handle_input_handle_event(&type" not in t_inp and "void input_event(" in t_inp:
+                  t_inp = re.sub(
+                      r"(void input_event\([^\{]+\{\s*)",
+                      r"""\1#ifdef CONFIG_KSU
           \tif (unlikely(ksu_input_hook))
           \t\tksu_handle_input_handle_event(&type, &code, &value);
           #endif\n""",
-                  t_inp,
-                  count=1
-              )
-              p_inp.write_text(t_inp, encoding="utf-8")
+                      t_inp,
+                      count=1
+                  )
+                  p_inp.write_text(t_inp, encoding="utf-8")
           PY
 
       - name: Compile kernel
@@ -176,13 +182,14 @@ jobs:
             -d RKP \
             -d UH \
             -e KSU \
+            -e KSU_MANUAL_HOOK \
             -d KSU_WITH_KPROBE \
             -d KSU_SUSFS || true
 
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y olddefconfig
 
-          grep -iE "CONFIG_KSU|SUSFS|DEFEX|PROCA|RKP" out/.config || true
+          grep -iE "CONFIG_KSU|MANUAL_HOOK|KPROBE|SUSFS|DEFEX|PROCA|RKP" out/.config || true
 
           set +e
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
@@ -191,14 +198,14 @@ jobs:
           set -e
 
           if [ "$BUILD_RC" -ne 0 ]; then
-            echo "=== ERROR PERTAMA ==="
-            grep -n -B 4 -A 4 "error:" build.log | head -n 25 || true
-            echo "=== POTONGAN ERROR UTAMA ==="
-            grep -n -B 8 -A 3 "error:" build.log | tail -n 35 || tail -n 30 build.log
+            echo "=== LINKER / UNDEFINED / ERROR LINES ==="
+            grep -niE "undefined reference|error:|ld\.lld:|multiple definition|implicit declaration" build.log | head -n 40 || true
+            echo "=== 45 BARIS TERAKHIR BUILD.LOG ==="
+            tail -n 45 build.log
             exit "$BUILD_RC"
           fi
           ls -lh out/arch/arm64/boot/
-
+          
       - name: Upload kernel image artifact
         if: always()
         uses: actions/upload-artifact@v4
