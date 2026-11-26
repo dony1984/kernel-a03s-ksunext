@@ -47,3 +47,19 @@ jobs:
           ' sh {} +
 
           ls -la kernel_src
+
+      - name: Inspect build script, defconfig, KSU-Next, and SUSFS
+        run: |
+          echo "=== build_kernel.sh ==="
+          cat kernel_src/build_kernel.sh || true
+
+          echo "=== build.config.mtk.aarch64 ==="
+          cat kernel_src/build.config.mtk.aarch64 || true
+
+          echo "=== Matching defconfigs ==="
+          ls kernel_src/arch/arm64/configs/ | grep -iE "a03|mt6765|k65|mtk" || true
+
+          echo "=== Check KSU-Next & SUSFS ==="
+          find kernel_src -maxdepth 3 -iname "*ksu*" -o -iname "*susfs*" || true
+          grep -rn "CONFIG_KSU" kernel_src/drivers/ kernel_src/fs/ kernel_src/security/ 2>/dev/null | head -n 20 || true
+          grep -rn "CONFIG_KSU_SUSFS" kernel_src/fs/ kernel_src/kernel/ 2>/dev/null | head -n 20 || true
