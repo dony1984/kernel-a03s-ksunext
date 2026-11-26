@@ -31,7 +31,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache curl flex git libssl-dev \
             libelf-dev dwarves python3 python-is-python3 zip unzip \
-            lz4 xz-utils zstd ca-certificates file
+            lz4 xz-utils zstd ca-certificates file patch
 
       - name: Download and extract kernel source
         env:
@@ -42,6 +42,7 @@ jobs:
           mkdir -p archive_tmp kernel_src toolchain
           gh release download "$TAG" -R "${{ github.repository }}" -p "$FILE" -D archive_tmp
           tar -xf "archive_tmp/$FILE" -C kernel_src
+          chmod -R u+w kernel_src
 
       - name: Install Clang and ARM64 GCC toolchain
         run: |
@@ -49,7 +50,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang lld llvm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-          # Pastikan path lama di build_kernel.sh/Kconfig tidak memicu 'not found' jika ada
           mkdir -p kernel_src/toolchain/clang/host/linux-x86/clang-r383902/bin
           ln -sf "$(command -v clang)" kernel_src/toolchain/clang/host/linux-x86/clang-r383902/bin/clang
           clang --version
@@ -58,14 +58,35 @@ jobs:
       - name: Setup KernelSU Next and SUSFS
         run: |
           cd kernel_src
+          chmod -R u+w drivers/
+
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
-          git clone --depth=1 -b kernel-4.19 https://gitlab.com/simonpunk/susfs4ksu.git ../susfs_tmp
-          cp -r ../susfs_tmp/kernel_patches/fs/* fs/ 2>/dev/null || true
-          cp -r ../susfs_tmp/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+          grep -n "kernelsu" drivers/Makefile drivers/Kconfig || true
 
+          rm -rf ../susfs_tmp
+          git clone --depth=1 -b kernel-4.19 https://gitlab.com/simonpunk/susfs4ksu.git ../susfs_tmp
+
+          cp -rv ../susfs_tmp/kernel_patches/fs/* fs/
+          cp -rv ../susfs_tmp/kernel_patches/include/linux/* include/linux/
+
+          # Terapkan patch kernel SuSFS jika tersedia di repositori
+          for p in ../susfs_tmp/kernel_patches/*4.19*.patch ../susfs_tmp/kernel_patches/*.patch; do
+            [ -f "$p" ] || continue
+            echo "=== Applying patch: $p ==="
+            patch -p1 --forward --dry-run < "$p" && patch -p1 --forward < "$p" || echo "WARN: patch conflict on $p"
+          done
+
+          # Terapkan patch sisi KernelSU jika tersedia di susfs4ksu
+          for kp in ../susfs_tmp/KernelSU-Next/*.patch ../susfs_tmp/ksu_patches/*.patch; do
+            [ -f "$kp" ] || continue
+            echo "=== Applying KSU patch: $kp ==="
+            patch -p1 --forward --dry-run < "$kp" && patch -p1 --forward < "$kp" || echo "WARN: ksu patch conflict on $kp"
+          done
+
+          find . -name "*.rej" || true
           ls -la | grep -iE "ksu|susfs" || true
-          find . -maxdepth 3 -iname "*ksu*" -o -iname "*susfs*" || true     
+          find . -maxdepth 3 -iname "*ksu*" -o -iname "*susfs*" || true
 
       - name: Compile kernel
         env:
@@ -89,9 +110,14 @@ jobs:
           scripts/config --file out/.config \
             -d MTK_GPU_SUPPORT \
             -d MTK_GPU_RGX \
-            -d GPU_RGX || true
+            -d GPU_RGX \
+            -e KSU \
+            -e KSU_SUSFS || true
+
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y olddefconfig
+
+          grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" out/.config || true
 
           set +e
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
