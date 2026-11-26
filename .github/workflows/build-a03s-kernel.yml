@@ -77,7 +77,6 @@ jobs:
 
           echo "=== Remaining .rej files ==="
           find . -name "*.rej" || true
-
           for r in $(find . -name "*.rej" | sort); do
           echo "================ $r ================"
           cat "$r"
