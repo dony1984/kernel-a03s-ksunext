@@ -233,7 +233,7 @@ jobs:
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
             KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y olddefconfig
 
-          grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" out/.config || true
+          grep -iE "CONFIG_KSU|SUSFS" out/.config || true
 
           set +e
           make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
@@ -242,11 +242,12 @@ jobs:
           set -e
 
           if [ "$BUILD_RC" -ne 0 ]; then
+            echo "=== ERROR PERTAMA ==="
+            grep -n -B 4 -A 4 "error:" build.log | head -n 25 || true
             echo "=== POTONGAN ERROR UTAMA ==="
             grep -n -B 8 -A 3 "error:" build.log | tail -n 35 || tail -n 30 build.log
             exit "$BUILD_RC"
           fi
-
           ls -lh out/arch/arm64/boot/
 
       - name: Upload kernel image artifact
