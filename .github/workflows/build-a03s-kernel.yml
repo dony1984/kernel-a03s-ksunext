@@ -55,6 +55,18 @@ jobs:
           clang --version
           aarch64-linux-gnu-gcc --version | head -n 1
 
+      - name: Setup KernelSU Next and SUSFS
+        run: |
+          cd kernel_src
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+
+          git clone --depth=1 -b kernel-4.19 https://gitlab.com/simonpunk/susfs4ksu.git ../susfs_tmp
+          cp -r ../susfs_tmp/kernel_patches/fs/* fs/ 2>/dev/null || true
+          cp -r ../susfs_tmp/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+
+          ls -la | grep -iE "ksu|susfs" || true
+          find . -maxdepth 3 -iname "*ksu*" -o -iname "*susfs*" || true     
+
       - name: Compile kernel
         env:
           DEFCONFIG: ${{ inputs.defconfig }}
