@@ -47,10 +47,19 @@ jobs:
         run: |
           mkdir -p kernel_src/toolchain/clang/host/linux-x86 \
                    kernel_src/toolchain/gcc/linux-x86/aarch64
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/clang-r383902 \
-            kernel_src/toolchain/clang/host/linux-x86/clang-r383902
+
+          if ! git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/android-clang-r383902 \
+            kernel_src/toolchain/clang/host/linux-x86/clang-r383902; then
+            echo "android-clang-r383902 tidak ditemukan, mencoba clang-r383902..."
+            git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/clang-r383902 \
+              kernel_src/toolchain/clang/host/linux-x86/clang-r383902 || true
+          fi
+
           git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
-            kernel_src/toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9
+            kernel_src/toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 || true
+
+          ls -la kernel_src/toolchain/clang/host/linux-x86/clang-r383902/bin 2>/dev/null || true
+          ls -la kernel_src/toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin 2>/dev/null || true
 
       - name: Compile kernel
         env:
@@ -59,10 +68,29 @@ jobs:
           cd kernel_src
           export ARCH=arm64
           export SUBARCH=arm64
-          export CC="$(pwd)/toolchain/clang/host/linux-x86/clang-r383902/bin/clang"
+
+          CLANG_BIN="$(pwd)/toolchain/clang/host/linux-x86/clang-r383902/bin"
+          GCC_BIN="$(pwd)/toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin"
+
+          if [ -x "$CLANG_BIN/clang" ]; then
+            export CC="$CLANG_BIN/clang"
+            export PATH="$CLANG_BIN:$PATH"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld llvm
+            export CC="clang"
+          fi
+
+          if [ -x "$GCC_BIN/aarch64-linux-androidkernel-ld" ]; then
+            export CROSS_COMPILE="$GCC_BIN/aarch64-linux-androidkernel-"
+            export PATH="$GCC_BIN:$PATH"
+          elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            export CROSS_COMPILE="aarch64-linux-gnu-"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+            export CROSS_COMPILE="aarch64-linux-gnu-"
+          fi
+
           export CLANG_TRIPLE="aarch64-linux-gnu-"
-          export CROSS_COMPILE="$(pwd)/toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-androidkernel-"
-          export PATH="$(pwd)/toolchain/clang/host/linux-x86/clang-r383902/bin:$(pwd)/toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin:$PATH"
 
           make -C "$(pwd)" O="$(pwd)/out" KCFLAGS=-w CONFIG_SECTION_MISMATCH_WARN_ONLY=y "$DEFCONFIG"
           make -C "$(pwd)" O="$(pwd)/out" KCFLAGS=-w CONFIG_SECTION_MISMATCH_WARN_ONLY=y -j"$(nproc)"
