@@ -1,4 +1,4 @@
-name: Build Samsung A03s Kernel
+name: Build Samsung A03s Kernel (KernelSU Next)
 
 on:
   workflow_dispatch:
@@ -15,23 +15,42 @@ on:
         description: "Nama defconfig target"
         required: true
         default: "a03s_defconfig"
+      with_ksu:
+        description: "Aktifkan KernelSU Next (false = kernel polos untuk tes A)"
+        type: boolean
+        default: true
+      ksu_branch:
+        description: "Argumen setup.sh KernelSU Next (legacy untuk kernel non-GKI)"
+        required: true
+        default: "legacy"
+      disable_defex_proca:
+        description: "Matikan SECURITY_DEFEX dan PROCA (umum untuk root, tidak menyentuh GPU)"
+        type: boolean
+        default: true
+      clang_ref:
+        description: "Branch AOSP prebuilts yang memuat clang-r383902"
+        required: true
+        default: "android11-release"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 22.04 dipilih supaya fallback clang-11 dari apt tersedia
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
+    defaults:
+      run:
+        shell: bash   # bash -eo pipefail, jadi kegagalan di pipe tidak tersembunyi
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git libssl-dev \
+            bc bison build-essential ccache cpio curl flex git libssl-dev \
             libelf-dev dwarves python3 python-is-python3 zip unzip \
-            lz4 xz-utils zstd ca-certificates file patch
+            lz4 xz-utils zstd ca-certificates file patch \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
 
       - name: Download and extract kernel source
         env:
@@ -39,91 +58,182 @@ jobs:
           TAG: ${{ inputs.release_tag }}
           FILE: ${{ inputs.archive_name }}
         run: |
-          mkdir -p archive_tmp kernel_src toolchain
-          gh release download "$TAG" -R "${{ github.repository }}" -p "$FILE" -D archive_tmp
+          mkdir -p archive_tmp kernel_src
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$FILE" -D archive_tmp
           tar -xf "archive_tmp/$FILE" -C kernel_src
           chmod -R u+w kernel_src
 
-      - name: Install Clang and ARM64 GCC toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang lld llvm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          # Cari root source (folder yang punya arch/arm64), jaga-jaga kalau arsip punya folder induk
+          ARCHDIR=$(find kernel_src -maxdepth 4 -type d -path '*/arch/arm64' \
+            | awk '{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$ARCHDIR" ]; then
+            echo "::error::arch/arm64 tidak ditemukan di arsip source"
+            exit 1
+          fi
+          KDIR=$(realpath "$ARCHDIR/../..")
+          echo "KDIR=$KDIR" >> "$GITHUB_ENV"
+          echo "Root source: $KDIR"
+          ls "$KDIR" | head -n 40
 
-          mkdir -p kernel_src/toolchain/clang/host/linux-x86/clang-r383902/bin
-          ln -sf "$(command -v clang)" kernel_src/toolchain/clang/host/linux-x86/clang-r383902/bin/clang
-          clang --version
+      - name: Setup Clang r383902 (fallback clang-11)
+        env:
+          CLANG_REF: ${{ inputs.clang_ref }}
+        run: |
+          CLANG_BIN=""
+          if git clone --depth=1 --filter=blob:none --sparse -b "$CLANG_REF" \
+               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang_pb \
+             && (cd clang_pb && git sparse-checkout set clang-r383902) \
+             && "$PWD/clang_pb/clang-r383902/bin/clang" --version >/dev/null 2>&1; then
+            CLANG_BIN="$PWD/clang_pb/clang-r383902/bin"
+            echo "Memakai AOSP clang-r383902"
+          else
+            echo "::warning::clang-r383902 gagal diambil/dijalankan, fallback ke clang-11 dari apt"
+            sudo apt-get install -y --no-install-recommends clang-11 lld-11 llvm-11
+            CLANG_BIN=/usr/lib/llvm-11/bin
+          fi
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          "$CLANG_BIN/clang" --version
           aarch64-linux-gnu-gcc --version | head -n 1
 
-      - name: Setup KernelSU Next (Non-GKI Syscall Hook)
+      - name: Setup KernelSU Next
+        if: ${{ inputs.with_ksu }}
+        env:
+          KSU_ARG: ${{ inputs.ksu_branch }}
         run: |
-          cd kernel_src
-          chmod -R u+w .
+          cd "$KDIR"
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_ARG"
 
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          grep -n "kernelsu" drivers/Makefile drivers/Kconfig || true
+          ls -la drivers/kernelsu
+          grep -n kernelsu drivers/Makefile drivers/Kconfig
+          echo "--- opsi Kconfig KernelSU ---"
+          grep -rn "^config KSU" drivers/kernelsu/Kconfig || true
 
-          curl -LSs "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/syscall_hook_patches.sh" -o ../syscall_hook_patches.sh
-          chmod +x ../syscall_hook_patches.sh
-          bash ../syscall_hook_patches.sh || true
+      - name: Apply syscall hook patches (manual hook)
+        if: ${{ inputs.with_ksu }}
+        run: |
+          cd "$KDIR"
+          curl -LSs "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/syscall_hook_patches.sh" \
+            -o "$GITHUB_WORKSPACE/syscall_hook_patches.sh"
+
+          set +e
+          bash "$GITHUB_WORKSPACE/syscall_hook_patches.sh" 2>&1 | tee "$GITHUB_WORKSPACE/hook.log"
+          HOOK_RC=${PIPESTATUS[0]}
+          set -e
+          echo "syscall_hook_patches.sh exit code: $HOOK_RC"
+
+          # Verifikasi: hook KernelSU harus benar-benar ada di file inti
+          MISSING=0
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c; do
+            c=$(grep -c "ksu_" "$f" || true)
+            echo "$f: $c referensi ksu_"
+            [ "$c" -gt 0 ] || MISSING=1
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::Hook KernelSU tidak terpasang utuh. Lihat hook.log."
+            exit 1
+          fi
+
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error::Ada hunk patch yang gagal (*.rej):"
+            find . -name '*.rej'
+            exit 1
+          fi
 
       - name: Compile kernel
         env:
           DEFCONFIG: ${{ inputs.defconfig }}
+          WITH_KSU: ${{ inputs.with_ksu }}
+          DISABLE_DEFEX_PROCA: ${{ inputs.disable_defex_proca }}
         run: |
-          cd kernel_src
+          cd "$KDIR"
           rm -rf out
           mkdir -p out
 
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CC=clang
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
+          MAKE_ARGS=(
+            O=out ARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            KCFLAGS=-Wno-error
+            CONFIG_SECTION_MISMATCH_WARN_ONLY=y
+          )
 
-          RELAX_FLAGS="-w -Wno-error -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-incompatible-pointer-types -Wno-unused-const-variable -Wno-int-conversion"
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-          make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y "$DEFCONFIG"
+          # Driver GPU/MTK TIDAK disentuh. Hanya opsi di bawah yang diubah.
+          CFG=(bash scripts/config --file out/.config)
 
-          scripts/config --file out/.config \
-            -d MTK_GPU_SUPPORT \
-            -d MTK_GPU_RGX \
-            -d GPU_RGX \
-            -d SECURITY_DEFEX \
-            -d PROCA \
-            -d RKP \
-            -d UH \
-            -e KSU \
-            -e KSU_MANUAL_HOOK \
-            -d KSU_SUSFS || true
+          if [ "$WITH_KSU" = "true" ]; then
+            "${CFG[@]}" -e KSU
+            if grep -q "config KSU_MANUAL_HOOK" drivers/kernelsu/Kconfig; then
+              "${CFG[@]}" -e KSU_MANUAL_HOOK
+            else
+              echo "::warning::KSU_MANUAL_HOOK tidak ada di Kconfig KernelSU ini, dilewati"
+            fi
+          fi
 
-          make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y olddefconfig
+          if [ "$DISABLE_DEFEX_PROCA" = "true" ]; then
+            "${CFG[@]}" -d SECURITY_DEFEX -d PROCA
+          fi
 
-          grep -iE "CONFIG_KSU|MANUAL_HOOK|SUSFS|DEFEX|PROCA|RKP" out/.config || true
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "=== Config penting (setelah olddefconfig) ==="
+          grep -E "^(# )?CONFIG_(KSU|SECURITY_DEFEX|PROCA)" out/.config || true
+          grep -E "MANUAL_HOOK" out/.config || true
+          echo "=== Config GPU (harus tetap seperti defconfig asli) ==="
+          grep -iE "CONFIG_.*GPU" out/.config | head -n 30 || true
+
+          if [ "$WITH_KSU" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config || {
+              echo "::error::CONFIG_KSU tidak aktif setelah olddefconfig"
+              exit 1
+            }
+          fi
 
           set +e
-          make -C "$(pwd)" O="$(pwd)/out" CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="$RELAX_FLAGS" CONFIG_SECTION_MISMATCH_WARN_ONLY=y -j4 2>&1 | tee build.log
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" 2>&1 | tee build.log
           BUILD_RC=${PIPESTATUS[0]}
           set -e
 
           if [ "$BUILD_RC" -ne 0 ]; then
-            echo "=== LINKER / UNDEFINED / ERROR LINES ==="
-            grep -niE "undefined reference|error:|ld\.lld:|multiple definition|implicit declaration" build.log | head -n 40 || true
+            echo "=== BARIS ERROR / LINKER ==="
+            grep -niE "undefined reference|error:|ld\.lld:|multiple definition" build.log | head -n 40 || true
             echo "=== 45 BARIS TERAKHIR BUILD.LOG ==="
             tail -n 45 build.log
             exit "$BUILD_RC"
           fi
-          ls -lh out/arch/arm64/boot/
 
-      - name: Upload kernel image artifact
+          ls -lh out/arch/arm64/boot/
+          echo "kernel.release: $(cat out/include/config/kernel.release)"
+
+      - name: Collect results
+        if: always()
+        run: |
+          mkdir -p result/dtb
+          cd "$KDIR" 2>/dev/null || exit 0
+          cp out/arch/arm64/boot/Image* "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
+          cp out/.config "$GITHUB_WORKSPACE/result/config_used" 2>/dev/null || true
+          cp out/include/config/kernel.release "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
+          cp build.log "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/hook.log" "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
+          cp out/arch/arm64/boot/dts/mediatek/*.dtb* "$GITHUB_WORKSPACE/result/dtb/" 2>/dev/null || true
+
+          if [ -f "$GITHUB_WORKSPACE/result/kernel.release" ]; then
+            {
+              echo "### kernel.release"
+              echo '```'
+              cat "$GITHUB_WORKSPACE/result/kernel.release"
+              echo '```'
+              echo "Bandingkan dengan \`uname -r\` di HP (stock). Beda = modul vendor bisa gagal dimuat."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload kernel artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: a03s-kernel-out
-          path: |
-            kernel_src/out/arch/arm64/boot/Image*
-            kernel_src/out/arch/arm64/boot/dts/mediatek/*.dtb*
+          name: a03s-kernel-${{ inputs.with_ksu && 'ksu' || 'plain' }}
+          path: result/
           if-no-files-found: warn
