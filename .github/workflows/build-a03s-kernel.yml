@@ -31,6 +31,10 @@ on:
         description: "Branch AOSP prebuilts yang memuat clang-r383902"
         required: true
         default: "android11-release"
+      localversion:
+        description: "Akhiran versi kernel (CONFIG_LOCALVERSION), harus sama dengan vermagic modul vendor. Kosongkan untuk tidak mengubah."
+        required: false
+        default: "-27193134-abA037FXXS5CWK1"
 
 jobs:
   build:
@@ -144,6 +148,7 @@ jobs:
           DEFCONFIG: ${{ inputs.defconfig }}
           WITH_KSU: ${{ inputs.with_ksu }}
           DISABLE_DEFEX_PROCA: ${{ inputs.disable_defex_proca }}
+          LOCALVERSION_STR: ${{ inputs.localversion }}
         run: |
           cd "$KDIR"
           rm -rf out
@@ -177,11 +182,25 @@ jobs:
             "${CFG[@]}" -d SECURITY_DEFEX -d PROCA
           fi
 
+          # Samakan versi kernel dengan vermagic modul vendor (wmt_*.ko, wlan_*.ko)
+          if [ -n "$LOCALVERSION_STR" ]; then
+            "${CFG[@]}" --set-str LOCALVERSION "$LOCALVERSION_STR" -d LOCALVERSION_AUTO
+          fi
+
           make "${MAKE_ARGS[@]}" olddefconfig
 
           echo "=== Config penting (setelah olddefconfig) ==="
           grep -E "^(# )?CONFIG_(KSU|SECURITY_DEFEX|PROCA)" out/.config || true
           grep -E "MANUAL_HOOK" out/.config || true
+          echo "=== Config yang membentuk vermagic (stock: SMP preempt mod_unload modversions) ==="
+          for c in SMP PREEMPT MODULE_UNLOAD MODVERSIONS MODULES; do
+            if grep -q "^CONFIG_$c=y" out/.config; then
+              echo "CONFIG_$c=y"
+            else
+              echo "::warning::CONFIG_$c tidak aktif, vermagic bisa tidak cocok dengan modul vendor"
+            fi
+          done
+          grep -E "^CONFIG_LOCALVERSION" out/.config || true
           echo "=== Config GPU (harus tetap seperti defconfig asli) ==="
           grep -iE "CONFIG_.*GPU" out/.config | head -n 30 || true
 
@@ -206,7 +225,14 @@ jobs:
           fi
 
           ls -lh out/arch/arm64/boot/
-          echo "kernel.release: $(cat out/include/config/kernel.release)"
+          REL=$(cat out/include/config/kernel.release)
+          echo "kernel.release: $REL"
+          if [ -n "$LOCALVERSION_STR" ]; then
+            case "$REL" in
+              *"$LOCALVERSION_STR") echo "kernel.release cocok dengan akhiran yang diminta" ;;
+              *) echo "::error::kernel.release ($REL) tidak berakhiran $LOCALVERSION_STR"; exit 1 ;;
+            esac
+          fi
 
       - name: Collect results
         if: always()
