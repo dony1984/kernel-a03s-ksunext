@@ -1,0 +1,343 @@
+name: Build Samsung A03s Kernel (KernelSU Next Wifi fix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag rilis source di GitHub Releases"
+        required: true
+        default: "source-v1"
+      archive_name:
+        description: "Nama file arsip source di Release"
+        required: true
+        default: "Kernel.tar.gz"
+      defconfig:
+        description: "Nama defconfig target"
+        required: true
+        default: "a03s_defconfig"
+      with_ksu:
+        description: "Aktifkan KernelSU Next (false = kernel polos untuk tes A)"
+        type: boolean
+        default: true
+      ksu_branch:
+        description: "Argumen setup.sh KernelSU Next (legacy untuk kernel non-GKI)"
+        required: true
+        default: "legacy"
+      disable_defex_proca:
+        description: "Matikan SECURITY_DEFEX dan PROCA (false = samakan dengan config stock)"
+        type: boolean
+        default: false
+      rom_config:
+        description: "Nama file config kernel ROM di Release yang sama (mis. config_rom.txt). Kosong = pakai defconfig"
+        required: false
+        default: "config_rom.txt"
+      clang_ref:
+        description: "Branch AOSP prebuilts yang memuat clang-r383902"
+        required: true
+        default: "android11-release"
+      localversion:
+        description: "Akhiran versi kernel (CONFIG_LOCALVERSION), harus sama dengan vermagic modul vendor. Kosongkan untuk tidak mengubah."
+        required: false
+        default: "-27193134-abA037FXXS5CWK1"
+
+jobs:
+  build:
+    # 22.04 dipilih supaya fallback clang-11 dari apt tersedia
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash   # bash -eo pipefail, jadi kegagalan di pipe tidak tersembunyi
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl flex git libssl-dev \
+            libelf-dev dwarves python3 python-is-python3 zip unzip \
+            lz4 xz-utils zstd ca-certificates file patch \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
+
+      - name: Download and extract kernel source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          FILE: ${{ inputs.archive_name }}
+          ROMCFG: ${{ inputs.rom_config }}
+        run: |
+          mkdir -p archive_tmp kernel_src
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$FILE" -D archive_tmp
+          if [ -n "$ROMCFG" ]; then
+            gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$ROMCFG" -D archive_tmp
+            ls -l "archive_tmp/$ROMCFG"
+          fi
+          tar -xf "archive_tmp/$FILE" -C kernel_src
+          chmod -R u+w kernel_src
+
+          # Cari root source (folder yang punya arch/arm64), jaga-jaga kalau arsip punya folder induk
+          ARCHDIR=$(find kernel_src -maxdepth 4 -type d -path '*/arch/arm64' \
+            | awk '{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$ARCHDIR" ]; then
+            echo "::error::arch/arm64 tidak ditemukan di arsip source"
+            exit 1
+          fi
+          KDIR=$(realpath "$ARCHDIR/../..")
+          echo "KDIR=$KDIR" >> "$GITHUB_ENV"
+          echo "Root source: $KDIR"
+          ls "$KDIR" | head -n 40
+
+      - name: Setup Clang r383902 (fallback clang-11)
+        env:
+          CLANG_REF: ${{ inputs.clang_ref }}
+        run: |
+          CLANG_BIN=""
+          if git clone --depth=1 --filter=blob:none --sparse -b "$CLANG_REF" \
+               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang_pb \
+             && (cd clang_pb && git sparse-checkout set clang-r383902) \
+             && "$PWD/clang_pb/clang-r383902/bin/clang" --version >/dev/null 2>&1; then
+            CLANG_BIN="$PWD/clang_pb/clang-r383902/bin"
+            echo "Memakai AOSP clang-r383902"
+          else
+            echo "::warning::clang-r383902 gagal diambil/dijalankan, fallback ke clang-11 dari apt"
+            sudo apt-get install -y --no-install-recommends clang-11 lld-11 llvm-11
+            CLANG_BIN=/usr/lib/llvm-11/bin
+          fi
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          "$CLANG_BIN/clang" --version
+          aarch64-linux-gnu-gcc --version | head -n 1
+
+      - name: Setup KernelSU Next
+        if: ${{ inputs.with_ksu }}
+        env:
+          KSU_ARG: ${{ inputs.ksu_branch }}
+        run: |
+          cd "$KDIR"
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_ARG"
+
+          ls -la drivers/kernelsu
+          grep -n kernelsu drivers/Makefile drivers/Kconfig
+          echo "--- opsi Kconfig KernelSU ---"
+          grep -rn "^config KSU" drivers/kernelsu/Kconfig || true
+
+      - name: Apply syscall hook patches (manual hook)
+        if: ${{ inputs.with_ksu }}
+        run: |
+          cd "$KDIR"
+          curl -LSs "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/syscall_hook_patches.sh" \
+            -o "$GITHUB_WORKSPACE/syscall_hook_patches.sh"
+
+          set +e
+          bash "$GITHUB_WORKSPACE/syscall_hook_patches.sh" 2>&1 | tee "$GITHUB_WORKSPACE/hook.log"
+          HOOK_RC=${PIPESTATUS[0]}
+          set -e
+          echo "syscall_hook_patches.sh exit code: $HOOK_RC"
+
+          # Verifikasi: hook KernelSU harus benar-benar ada di file inti
+          MISSING=0
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c; do
+            c=$(grep -c "ksu_" "$f" || true)
+            echo "$f: $c referensi ksu_"
+            [ "$c" -gt 0 ] || MISSING=1
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::Hook KernelSU tidak terpasang utuh. Lihat hook.log."
+            exit 1
+          fi
+
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error::Ada hunk patch yang gagal (*.rej):"
+            find . -name '*.rej'
+            exit 1
+          fi
+
+      - name: Compile kernel
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          WITH_KSU: ${{ inputs.with_ksu }}
+          DISABLE_DEFEX_PROCA: ${{ inputs.disable_defex_proca }}
+          LOCALVERSION_STR: ${{ inputs.localversion }}
+          ROMCFG: ${{ inputs.rom_config }}
+        run: |
+          cd "$KDIR"
+          rm -rf out
+          mkdir -p out
+
+          # Sesuai README_Kernel.txt Samsung
+          export ANDROID_MAJOR_VERSION=r
+          export ARCH=arm64
+
+          MAKE_ARGS=(
+            O=out ARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            KCFLAGS=-Wno-error
+            CONFIG_SECTION_MISMATCH_WARN_ONLY=y
+          )
+
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          # Pakai config kernel ROM/stock sebagai dasar (supaya cocok dengan modul vendor)
+          if [ -n "$ROMCFG" ]; then
+            cp out/.config out/.config.defconfig_asli
+            cp "$GITHUB_WORKSPACE/archive_tmp/$ROMCFG" out/.config
+            echo "Memakai $ROMCFG sebagai .config dasar"
+          fi
+
+          # Driver GPU/MTK TIDAK disentuh. Hanya opsi di bawah yang diubah.
+          CFG=(bash scripts/config --file out/.config)
+
+          if [ "$WITH_KSU" = "true" ]; then
+            "${CFG[@]}" -e KSU
+            if grep -q "config KSU_MANUAL_HOOK" drivers/kernelsu/Kconfig; then
+              "${CFG[@]}" -e KSU_MANUAL_HOOK
+            else
+              echo "::warning::KSU_MANUAL_HOOK tidak ada di Kconfig KernelSU ini, dilewati"
+            fi
+          fi
+
+          if [ "$DISABLE_DEFEX_PROCA" = "true" ]; then
+            "${CFG[@]}" -d SECURITY_DEFEX -d PROCA
+          fi
+
+          # Samakan versi kernel dengan vermagic modul vendor (wmt_*.ko, wlan_*.ko)
+          if [ -n "$LOCALVERSION_STR" ]; then
+            "${CFG[@]}" --set-str LOCALVERSION "$LOCALVERSION_STR" -d LOCALVERSION_AUTO
+          fi
+
+          echo "DEFEX sebelum olddefconfig: $(grep -E 'SECURITY_DEFEX' out/.config || echo 'tidak ada')"
+          make "${MAKE_ARGS[@]}" olddefconfig
+          echo "DEFEX sesudah olddefconfig: $(grep -E 'SECURITY_DEFEX' out/.config || echo 'tidak ada')"
+
+          # Diagnostik: kenapa DEFEX bisa hilang saat KernelSU aktif
+          if [ "$WITH_KSU" = "true" ]; then
+            echo "=== Diagnostik DEFEX ==="
+            DK=$(find security -name 'Kconfig*' -path '*defex*' | head -n1)
+            echo "Kconfig DEFEX: $DK"
+            [ -n "$DK" ] && sed -n '1,60p' "$DK" || true
+            echo "--- 'DEFEX' di KernelSU / hook ---"
+            grep -rn "DEFEX" drivers/kernelsu KernelSU-Next 2>/dev/null | head -n 20 || true
+            echo "--- 'KSU' di security/samsung ---"
+            grep -rn "KSU" security/samsung 2>/dev/null | head -n 20 || true
+            echo "--- 'defex' di hook.log ---"
+            grep -in "defex" "$GITHUB_WORKSPACE/hook.log" 2>/dev/null | head -n 20 || true
+          fi
+
+          # Penjaga: config akhir tidak boleh menyimpang dari config ROM
+          # (kecuali KSU, localversion, linker, dan DEFEX/PROCA bila sengaja dimatikan)
+          if [ -n "$ROMCFG" ]; then
+            python3 - <<'PY'
+          import os, re, sys
+          def load(p):
+              d = {}
+              for l in open(p, errors='ignore'):
+                  l = l.rstrip('\n')
+                  m = re.match(r'^(CONFIG_\w+)=(.*)$', l)
+                  if m:
+                      d[m.group(1)] = m.group(2)
+                      continue
+                  m = re.match(r'^# (CONFIG_\w+) is not set$', l)
+                  if m:
+                      d[m.group(1)] = 'n'
+              return d
+          a = load(os.path.join(os.environ['GITHUB_WORKSPACE'], 'archive_tmp', os.environ['ROMCFG']))
+          b = load('out/.config')
+          allow_prefix = ('CONFIG_KSU', 'CONFIG_LOCALVERSION')
+          allow = {'CONFIG_LD_IS_LLD', 'CONFIG_LTO_CLANG', 'CONFIG_TOOLS_SUPPORT_RELR'}
+          if os.environ.get('DISABLE_DEFEX_PROCA') == 'true':
+              allow |= {'CONFIG_SECURITY_DEFEX', 'CONFIG_DEFEX_KERNEL_ONLY', 'CONFIG_PROCA'}
+          bad = []
+          for k in sorted(set(a) | set(b)):
+              if a.get(k) != b.get(k) and k not in allow and not k.startswith(allow_prefix):
+                  bad.append(f"{k}: ROM={a.get(k)} | build={b.get(k)}")
+          print("DISABLE_DEFEX_PROCA =", os.environ.get('DISABLE_DEFEX_PROCA'))
+          print("CONFIG_SECURITY_DEFEX di build:", b.get('CONFIG_SECURITY_DEFEX'), "| di ROM:", a.get('CONFIG_SECURITY_DEFEX'))
+          if bad:
+              print("::error::Config build menyimpang dari config ROM:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("Config build sesuai config ROM (selain perbedaan yang diizinkan)")
+          PY
+          fi
+
+          echo "=== Config penting (setelah olddefconfig) ==="
+          grep -E "^(# )?CONFIG_(KSU|SECURITY_DEFEX|PROCA)" out/.config || true
+          grep -E "MANUAL_HOOK" out/.config || true
+          echo "=== Config yang membentuk vermagic (stock: SMP preempt mod_unload modversions) ==="
+          for c in SMP PREEMPT MODULE_UNLOAD MODVERSIONS MODULES; do
+            if grep -q "^CONFIG_$c=y" out/.config; then
+              echo "CONFIG_$c=y"
+            else
+              echo "::warning::CONFIG_$c tidak aktif, vermagic bisa tidak cocok dengan modul vendor"
+            fi
+          done
+          grep -E "^CONFIG_LOCALVERSION" out/.config || true
+          echo "=== Versi driver GPU: config vs folder di source ==="
+          grep -E "^CONFIG_MTK_GPU_VERSION" out/.config || true
+          ls -d drivers/gpu/mediatek/gpu_rgx/*/ 2>/dev/null || true
+          echo "=== Config GPU (harus tetap seperti defconfig asli) ==="
+          grep -iE "CONFIG_.*GPU" out/.config | head -n 30 || true
+
+          if [ "$WITH_KSU" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config || {
+              echo "::error::CONFIG_KSU tidak aktif setelah olddefconfig"
+              exit 1
+            }
+          fi
+
+          set +e
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" 2>&1 | tee build.log
+          BUILD_RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$BUILD_RC" -ne 0 ]; then
+            echo "=== BARIS ERROR / LINKER ==="
+            grep -niE "undefined reference|error:|ld\.lld:|multiple definition" build.log | head -n 40 || true
+            echo "=== 45 BARIS TERAKHIR BUILD.LOG ==="
+            tail -n 45 build.log
+            exit "$BUILD_RC"
+          fi
+
+          ls -lh out/arch/arm64/boot/
+          REL=$(cat out/include/config/kernel.release)
+          echo "kernel.release: $REL"
+          if [ -n "$LOCALVERSION_STR" ]; then
+            case "$REL" in
+              *"$LOCALVERSION_STR") echo "kernel.release cocok dengan akhiran yang diminta" ;;
+              *) echo "::error::kernel.release ($REL) tidak berakhiran $LOCALVERSION_STR"; exit 1 ;;
+            esac
+          fi
+
+      - name: Collect results
+        if: always()
+        run: |
+          mkdir -p result/dtb
+          cd "$KDIR" 2>/dev/null || exit 0
+          cp out/arch/arm64/boot/Image* "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
+          cp out/.config "$GITHUB_WORKSPACE/result/config_used" 2>/dev/null || true
+          cp out/.config.defconfig_asli "$GITHUB_WORKSPACE/result/config_defconfig_asli" 2>/dev/null || true
+          cp out/include/config/kernel.release "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
+          cp build.log "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/hook.log" "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
+          cp out/arch/arm64/boot/dts/mediatek/*.dtb* "$GITHUB_WORKSPACE/result/dtb/" 2>/dev/null || true
+
+          if [ -f "$GITHUB_WORKSPACE/result/kernel.release" ]; then
+            {
+              echo "### kernel.release"
+              echo '```'
+              cat "$GITHUB_WORKSPACE/result/kernel.release"
+              echo '```'
+              echo "Bandingkan dengan \`uname -r\` di HP (stock). Beda = modul vendor bisa gagal dimuat."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload kernel artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a03s-kernel-${{ inputs.with_ksu && 'ksu' || 'plain' }}
+          path: result/
+          if-no-files-found: warn
