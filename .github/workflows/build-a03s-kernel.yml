@@ -210,6 +210,43 @@ jobs:
 
           make "${MAKE_ARGS[@]}" olddefconfig
 
+          # Penjaga: config akhir tidak boleh menyimpang dari config ROM
+          # (kecuali KSU, localversion, linker, dan DEFEX/PROCA bila sengaja dimatikan)
+          if [ -n "$ROMCFG" ]; then
+            python3 - <<'PY'
+          import os, re, sys
+          def load(p):
+              d = {}
+              for l in open(p, errors='ignore'):
+                  l = l.rstrip('\n')
+                  m = re.match(r'^(CONFIG_\w+)=(.*)$', l)
+                  if m:
+                      d[m.group(1)] = m.group(2)
+                      continue
+                  m = re.match(r'^# (CONFIG_\w+) is not set$', l)
+                  if m:
+                      d[m.group(1)] = 'n'
+              return d
+          a = load(os.path.join(os.environ['GITHUB_WORKSPACE'], 'archive_tmp', os.environ['ROMCFG']))
+          b = load('out/.config')
+          allow_prefix = ('CONFIG_KSU', 'CONFIG_LOCALVERSION')
+          allow = {'CONFIG_LD_IS_LLD', 'CONFIG_LTO_CLANG', 'CONFIG_TOOLS_SUPPORT_RELR'}
+          if os.environ.get('DISABLE_DEFEX_PROCA') == 'true':
+              allow |= {'CONFIG_SECURITY_DEFEX', 'CONFIG_DEFEX_KERNEL_ONLY', 'CONFIG_PROCA'}
+          bad = []
+          for k in sorted(set(a) | set(b)):
+              if a.get(k) != b.get(k) and k not in allow and not k.startswith(allow_prefix):
+                  bad.append(f"{k}: ROM={a.get(k)} | build={b.get(k)}")
+          print("DISABLE_DEFEX_PROCA =", os.environ.get('DISABLE_DEFEX_PROCA'))
+          print("CONFIG_SECURITY_DEFEX di build:", b.get('CONFIG_SECURITY_DEFEX'), "| di ROM:", a.get('CONFIG_SECURITY_DEFEX'))
+          if bad:
+              print("::error::Config build menyimpang dari config ROM:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("Config build sesuai config ROM (selain perbedaan yang diizinkan)")
+          PY
+          fi
+
           echo "=== Config penting (setelah olddefconfig) ==="
           grep -E "^(# )?CONFIG_(KSU|SECURITY_DEFEX|PROCA)" out/.config || true
           grep -E "MANUAL_HOOK" out/.config || true
