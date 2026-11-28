@@ -1,4 +1,4 @@
-name: Build Samsung A03s Kernel (KernelSU Next Wifi fix)
+name: Build Samsung A03s Kernel (KernelSU Next)
 
 on:
   workflow_dispatch:
