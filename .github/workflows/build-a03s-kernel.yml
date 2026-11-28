@@ -24,9 +24,13 @@ on:
         required: true
         default: "legacy"
       disable_defex_proca:
-        description: "Matikan SECURITY_DEFEX dan PROCA (umum untuk root, tidak menyentuh GPU)"
+        description: "Matikan SECURITY_DEFEX dan PROCA (false = samakan dengan config stock)"
         type: boolean
-        default: true
+        default: false
+      rom_config:
+        description: "Nama file config kernel ROM di Release yang sama (mis. config_rom.txt). Kosong = pakai defconfig"
+        required: false
+        default: "config_rom.txt"
       clang_ref:
         description: "Branch AOSP prebuilts yang memuat clang-r383902"
         required: true
@@ -61,9 +65,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.release_tag }}
           FILE: ${{ inputs.archive_name }}
+          ROMCFG: ${{ inputs.rom_config }}
         run: |
           mkdir -p archive_tmp kernel_src
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$FILE" -D archive_tmp
+          if [ -n "$ROMCFG" ]; then
+            gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$ROMCFG" -D archive_tmp
+            ls -l "archive_tmp/$ROMCFG"
+          fi
           tar -xf "archive_tmp/$FILE" -C kernel_src
           chmod -R u+w kernel_src
 
@@ -149,10 +158,15 @@ jobs:
           WITH_KSU: ${{ inputs.with_ksu }}
           DISABLE_DEFEX_PROCA: ${{ inputs.disable_defex_proca }}
           LOCALVERSION_STR: ${{ inputs.localversion }}
+          ROMCFG: ${{ inputs.rom_config }}
         run: |
           cd "$KDIR"
           rm -rf out
           mkdir -p out
+
+          # Sesuai README_Kernel.txt Samsung
+          export ANDROID_MAJOR_VERSION=r
+          export ARCH=arm64
 
           MAKE_ARGS=(
             O=out ARCH=arm64
@@ -165,6 +179,13 @@ jobs:
           )
 
           make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          # Pakai config kernel ROM/stock sebagai dasar (supaya cocok dengan modul vendor)
+          if [ -n "$ROMCFG" ]; then
+            cp out/.config out/.config.defconfig_asli
+            cp "$GITHUB_WORKSPACE/archive_tmp/$ROMCFG" out/.config
+            echo "Memakai $ROMCFG sebagai .config dasar"
+          fi
 
           # Driver GPU/MTK TIDAK disentuh. Hanya opsi di bawah yang diubah.
           CFG=(bash scripts/config --file out/.config)
@@ -201,6 +222,9 @@ jobs:
             fi
           done
           grep -E "^CONFIG_LOCALVERSION" out/.config || true
+          echo "=== Versi driver GPU: config vs folder di source ==="
+          grep -E "^CONFIG_MTK_GPU_VERSION" out/.config || true
+          ls -d drivers/gpu/mediatek/gpu_rgx/*/ 2>/dev/null || true
           echo "=== Config GPU (harus tetap seperti defconfig asli) ==="
           grep -iE "CONFIG_.*GPU" out/.config | head -n 30 || true
 
@@ -241,6 +265,7 @@ jobs:
           cd "$KDIR" 2>/dev/null || exit 0
           cp out/arch/arm64/boot/Image* "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
           cp out/.config "$GITHUB_WORKSPACE/result/config_used" 2>/dev/null || true
+          cp out/.config.defconfig_asli "$GITHUB_WORKSPACE/result/config_defconfig_asli" 2>/dev/null || true
           cp out/include/config/kernel.release "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
           cp build.log "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
           cp "$GITHUB_WORKSPACE/hook.log" "$GITHUB_WORKSPACE/result/" 2>/dev/null || true
