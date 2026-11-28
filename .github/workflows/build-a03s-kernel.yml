@@ -208,7 +208,23 @@ jobs:
             "${CFG[@]}" --set-str LOCALVERSION "$LOCALVERSION_STR" -d LOCALVERSION_AUTO
           fi
 
+          echo "DEFEX sebelum olddefconfig: $(grep -E 'SECURITY_DEFEX' out/.config || echo 'tidak ada')"
           make "${MAKE_ARGS[@]}" olddefconfig
+          echo "DEFEX sesudah olddefconfig: $(grep -E 'SECURITY_DEFEX' out/.config || echo 'tidak ada')"
+
+          # Diagnostik: kenapa DEFEX bisa hilang saat KernelSU aktif
+          if [ "$WITH_KSU" = "true" ]; then
+            echo "=== Diagnostik DEFEX ==="
+            DK=$(find security -name 'Kconfig*' -path '*defex*' | head -n1)
+            echo "Kconfig DEFEX: $DK"
+            [ -n "$DK" ] && sed -n '1,60p' "$DK" || true
+            echo "--- 'DEFEX' di KernelSU / hook ---"
+            grep -rn "DEFEX" drivers/kernelsu KernelSU-Next 2>/dev/null | head -n 20 || true
+            echo "--- 'KSU' di security/samsung ---"
+            grep -rn "KSU" security/samsung 2>/dev/null | head -n 20 || true
+            echo "--- 'defex' di hook.log ---"
+            grep -in "defex" "$GITHUB_WORKSPACE/hook.log" 2>/dev/null | head -n 20 || true
+          fi
 
           # Penjaga: config akhir tidak boleh menyimpang dari config ROM
           # (kecuali KSU, localversion, linker, dan DEFEX/PROCA bila sengaja dimatikan)
